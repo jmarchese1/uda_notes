@@ -1,0 +1,411 @@
+---
+title: "Homework 2_25"
+author: "Jason Marchese"
+format:
+  html:
+    toc: true
+    toc-location: left
+    self-contained: true
+jupyter: python3
+---
+
+## Task 1
+
+We are going to return to the table of the top 100 wrestlers: https://www.cagematch.net/?id=2&view=statistics. Specifically, you are going to get the ratings/comments tables for each wrestler.
+
+```{python}
+#import libraries 
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+import regex as re
+
+#ratings and comments for each wrestler
+url = "https://www.cagematch.net/?id=2&view=statistics"
+request = requests.get(url)
+soup = BeautifulSoup(request.content, 'html.parser')
+
+#find the table
+table = soup.find_all('table')[0]
+table
+
+#rows of the table
+rows = table.find_all("tr")[1:]
+
+rows
+
+data = []
+for row in rows:
+  cols = row.find_all("td")
+
+  rank = cols[0].text.strip()
+  gimmick = cols[1].text.strip()
+  birthplace = cols[2].text.strip()
+  height = cols[3].text.strip()
+  weight = cols[4].text.strip()
+  promotions = cols[5].find("img")["alt"].strip() if cols[5].find("img") else "unknown"
+  rating = cols[6].text.strip()
+  votes = cols[7].text.strip()
+
+  data.append({
+    "rank": rank,
+    "gimmick": gimmick,
+    "birthplace": birthplace,
+    "height": height,
+    "weight": weight,
+    "promotions": promotions,
+    "rating": rating,
+    "votes": votes
+  })
+
+data
+
+#here is the data frame of the initial link
+dataFrame = pd.DataFrame(data)
+dataFrame.head()
+```
+
+for each wrestler, need to go to their comments page and get the comments and ratings.
+
+```{python}
+#get the links to each wrestler..
+links = soup.select('div.TableContents tr td a')
+wrestler_links = [link['href'] for link in links if "gimmick=" in link['href']]
+
+#retriving the nr code for each wrestler to get to the comments page of each wrestler
+nr_codes = []
+for wrestler_link in wrestler_links:
+  match = re.search(r"nr=(\d+)", wrestler_link)
+  nr_value = match.group(1)
+  nr_codes.append(nr_value)
+
+len(nr_codes), len(wrestler_links), len(dataFrame["gimmick"]) #everything lines up 
+
+#making a dataframe to connect the wrestler to the code, where I can later add the ratings and comments and then drop the code.
+wrestlers_df = pd.DataFrame({
+  "wrestler" : dataFrame["gimmick"],
+  "nr_code" : nr_codes
+})
+
+wrestlers_df #heres the code to wrestler mapping
+
+#now getting to the comments page of each wrestler and taking the comments and ratings
+wrestler_comments = []
+for code in nr_codes:
+  comments_url = f"https://www.cagematch.net/?id=2&nr={code}&page=99"
+  comments_request = requests.get(comments_url)
+  comments_soup = BeautifulSoup(comments_request.content, "html.parser")
+  comments = comments_soup.find_all("div", class_ = "CommentContents".strip())[1:]
+  wrestler_comments.append(pd.DataFrame({"comments": comments, "nr_code": code, "wrestler": wrestlers_df[wrestlers_df["nr_code"] == code]["wrestler"].values[0]}))
+
+#cleaning the comments
+for wrestler in wrestler_comments:
+  wrestler["comments"] = wrestler["comments"].apply(lambda x: x.text.strip())
+
+#extracting the ratings from the comments
+for wrestler in wrestler_comments:
+  wrestler["ratings"] = wrestler["comments"].apply(lambda x: re.search(r"\d+.\d", x).group(0) if re.search(r"\d+.\d", x) else np.nan)
+  
+#concatenating the individual wrestler dataframes into one joined dataframe
+#wrestler_comments is the individual wrestler dataframes
+full_comments = pd.concat(wrestler_comments)
+
+len(full_comments) # the amount of comments for all the wrestlers
+
+#drop the rating from the comments:
+text_only = []
+for comment in full_comments["comments"]:
+  match = re.sub(r"^\[\d*.?\d+\]\s", "", comment)
+  text_only.append(match)
+
+#updating the comment box to not include the rating at the beginning 
+full_comments["comments"] = text_only
+
+#checking for na values in the ratings 
+full_comments["ratings"].isnull().sum() #theres a decent amount of missing data..
+
+#was going to mean impute missing data but that might be misleading to the significance of the text so ill drop those rows instead..
+full_comments = full_comments.dropna()
+
+#dropping the nr code from the dataframe because we dont need that anymore
+full_comments.drop(["nr_code"], axis = 1, inplace = True)
+
+full_comments
+
+#-------------------------------------------------------------------------------------------#
+
+                   #data exploration and clean up#
+
+full_comments["ratings"] = pd.to_numeric(full_comments["ratings"], errors = "coerce")
+
+full_comments.groupby("wrestler")["ratings"].mean()
+
+#some how aja kong has a rating of 2000 in one match.. theres likley other examples with incorrect ratings, lets drop columns with ratings greater than 10 
+full_comments[full_comments["wrestler"] == "Aja Kong"]["ratings"].max()
+
+#this works in getting the average rating for each wrestler because it removes the incorrect entries
+full_comments[full_comments["ratings"] <= 10.0].groupby("wrestler")["ratings"].mean().sort_values(ascending = False)
+
+#updating this to be the main dataframe
+full_comments = full_comments[full_comments["ratings"] <= 10.0]
+
+#checking the distribution of comments across wrestlers
+full_comments["wrestler"].value_counts() #some famous wrestlers have thousands of comments
+
+#deleting numbers from all of the comments to make sure the sentiment analysis is only dealing with text.
+full_comments["comments"] = full_comments["comments"].astype(str).apply(lambda x: re.sub(r"\d+", "", x))
+
+#the majority of comments are 10s
+full_comments["ratings"].agg(["mean", "median", "max", "min"]) 
+
+#viewing the final dataframe, for entiment ratings will only need full_comments["comments"]
+full_comments.head()
+```
+
+## Task 2
+
+Perform any form of sentiment analysis. What is the relationship between a reviewer's sentiment and their rating?
+
+```{python}
+#what is the sentiment rating of the comments?
+
+#-----------------------------simple sentiment analysis-----------------------------------#
+
+from textblob import TextBlob
+
+scores = []
+
+for comment in full_comments["comments"]:
+  blob = TextBlob(comment)
+  score = blob.polarity
+  scores.append(score)
+
+#converting scores into an array
+scores = np.array(scores)
+
+scores.max() #highest positive rating is 1
+scores.min() #lowest negative rating is 0
+scores.mean() #the average sentiment is 0.2
+scores.std() #the standard deviation is 0.26
+
+#checking if these scores are correalated to the ratings
+
+len(scores), len(full_comments["ratings"]) #rows line up
+
+#adding the simple score to the pandas dataframe
+full_comments["simple_score"] = scores
+
+#getting the correlation between the ratings and the simple score
+simple_score_correlation = round(full_comments["simple_score"].corr(full_comments["ratings"]), 2)
+
+print(f"the correlation between the simple score using textblob and the ratings is {simple_score_correlation}")
+
+#------------------------------smarter sentiment analysis-------------------------------#
+
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+
+Vader = SentimentIntensityAnalyzer()
+
+smart_scores = []
+for comment in full_comments["comments"]:
+  smart_score = Vader.polarity_scores(comment).get("compound")
+  smart_scores.append(smart_score)
+
+full_comments["smart_score"] = smart_scores
+
+full_comments["smart_score"].max()
+full_comments["smart_score"].min()
+
+#the correlation of the smart scores and the ratings
+full_comments["smart_score"].corr(full_comments["ratings"])
+
+#------------------trying to understand the reasoning for low correlations---------------------#
+```
+
+```{python}
+#the correaltion between sentiment analysis and rating is not extremely high but its likely due to ratings being skewed more than ratings
+
+sns.set_style("whitegrid")
+plt.title("count plot of ratings (lots of 10s)", fontdict = {"weight" : "bold"})
+sns.countplot(data = full_comments, x = "ratings", color ="red", alpha = 0.7)
+```
+
+```{python}
+#the scores are a lot more evenly distributed compared to the ratings.. 
+sns.set_style("white")
+plt.title("distribution of smart scores")
+sns.histplot(data = full_comments, x = "smart_score", alpha = 0.7)
+plt.xlabel("smart score")
+```
+```{python}
+#checking the distribution of simple scores
+plt.title("simple score distribution", fontdict = {})
+sns.histplot(data = full_comments, x = "simple_score", bins = 20)
+
+#the simple scores have a closer distribution to the ratings somehow.. 
+#it classifies most things as neutral where the majortoty class should be 10
+```
+
+```{python}
+#going to try to minmax scale the ratings and see if the correlation increases based on ratings scaled by standard deviation around 0
+
+from sklearn.preprocessing import StandardScaler
+
+full_comments["ratings"].isnull().sum() #nonulls
+type(full_comments.iloc[0]["ratings"]) #data type floats
+
+scaler = StandardScaler()
+all_ratings = np.array(full_comments["ratings"]).reshape(-1, 1)
+scaled_ratings = scaler.fit_transform(all_ratings)
+```
+```{python}
+#visualising the scaled ratings
+plt.hist(scaled_ratings)
+
+#adding scaled ratings to the dataframe
+full_comments["scaled_ratings"] = scaled_ratings
+full_comments["simple_score"].corr(full_comments["scaled_ratings"])
+#exact same correlation :(
+
+#going to try to update the simple scores to be more accurate
+revised_simple = []
+for simple_score in full_comments["simple_score"]:
+  if simple_score > 0 and simple_score < 0.25:
+    new_simple_score = .95
+    revised_simple.append(new_simple_score)
+  else:
+    new_simple_score = simple_score
+    revised_simple.append(new_simple_score)
+```
+
+```{python}
+#viewing the new distribution
+plt.title("changed the interpertation of the scores")
+plt.hist(revised_simple)
+
+full_comments["revised_simple"] = revised_simple
+
+#this made it much worse so that wasnt the problem
+full_comments["revised_simple"].corr(full_comments["ratings"])
+
+
+```
+
+```{python}
+#going to try to get new sentiment scores by only measuring the positivity of a comment because most of the ratings are high. This should help map to the skewed rating distribution
+
+#extracting english comments
+import langid
+english_comments = [comment for comment in full_comments["comments"] if langid.classify(comment)[0] == "en"]
+
+
+def filtered_sentiment(text):
+    blob = TextBlob(text)
+    sentiment = blob.sentiment.polarity  # -1 to 1 scale
+    return max(sentiment, 0)  # Set all negative scores to 0
+
+filtered_scores = []
+for comment in english_comments:
+  score = filtered_sentiment(comment)
+  filtered_scores.append(score)
+
+#matching each sentiment score to its corresponding rating
+english_comment_ratings = []
+for comment, rating, sentiment in zip(full_comments["comments"], full_comments["ratings"], filtered_scores):
+    english_comment_ratings.append((comment, rating, sentiment))
+
+len(english_comment_ratings)
+len(filtered_scores)
+
+df_matched = pd.DataFrame(english_comment_ratings, columns = ["comments", "ratings", "sentiment"])
+
+df_matched["ratings"].corr(df_matched["sentiment"])
+
+df_matched.loc[df_matched["ratings"] == 10.0, "sentiment"] = 1.0
+
+df_matched.head()
+
+df_matched["ratings"].corr(df_matched["sentiment"]) #high correaltion between sentiment and rating.
+
+#the ratings mostly lie at the top of the range 0-10 and the sentiment scores were not finding that.
+```
+
+## Task 3
+
+Perform any type of topic modeling on the comments. What are the main topics of the comments? How can you use those topics to understand what people value?
+
+
+```{python}
+
+#------------------------------creating topics with sklearns LDA-------------------------------#
+
+
+from sklearn.decomposition import LatentDirichletAllocation
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+# Vectorize the comments
+vectorizer = TfidfVectorizer(stop_words='english', max_features = 1000)
+comment_matrix = vectorizer.fit_transform(english_comments)
+
+# Fit the LDA model
+lda = LatentDirichletAllocation(n_components=3, random_state=42)
+lda.fit(comment_matrix)
+
+# Display the topics
+def display_topics(model, feature_names, no_top_words):
+  for topic_idx, topic in enumerate(model.components_):
+    print(f"Topic {topic_idx}:")
+    print(" ".join([feature_names[i] for i in topic.argsort()[:-no_top_words - 1:-1]]))
+
+no_top_words = 4
+display_topics(lda, vectorizer.get_feature_names_out(), no_top_words)
+
+
+#----------------------------topic modeling use bertopic transformer---------------------------#
+
+#installing packages
+from bertopic import BERTopic
+from bertopic.vectorizers import ClassTfidfTransformer
+import nltk
+from joblib import load, dump
+import pprint as pprint
+from nltk.corpus import stopwords
+
+#dropping stopwords from the english comments
+nltk.download('stopwords')
+stop_words = set(stopwords.words("english"))
+
+def remove_stopwords(text):
+  return " ".join([word for word in text.split() if word.lower() not in stop_words])
+
+english_comments = [remove_stopwords(comment) for comment in english_comments] #stopwords removed
+
+ctfidf_model = ClassTfidfTransformer(
+  reduce_frequent_words=True
+)
+
+topic_model = BERTopic(ctfidf_model= ctfidf_model)
+
+topics, probs = topic_model.fit_transform(english_comments)
+
+topic_model.get_topic_info() #all 122 topics, probably too many topics
+
+topic_model.get_topic(0) # the floats are weight contributions to the topics
+
+topic_model.reduce_topics(english_comments, nr_topics = 3)
+
+topic_model.get_topic_info() #one topic about best wrestlers, another about best matches another about refs, surprised theres not a group of negative reviews
+
+custom_labels = {-1 : "best wrestlers",
+                  0 : "best matches",
+                  1 : "refs"}
+
+topic_model.set_topic_labels(custom_labels)
+
+topic_model.get_topic_info()
+
+
+```
